@@ -1,0 +1,31 @@
+import socket
+
+protocol jambo {
+    as big endian
+
+    string(6) dst_mac_raw
+    string(4) dst_ip_raw
+    uint8 magic
+
+    validate packet {
+        return packet.ip.dst_ip == '0.0.0.0'
+    }
+
+    property dst_mac layer {
+        dst_mac_hex = layer.dst_mac_raw.encode('hex')
+        return ':'.join([dst_mac_hex[i]+dst_mac_hex[i+1] for i in xrange(0, 11, 2)])
+    }
+
+    property dst_ip layer {
+        return socket.inet_ntoa(layer.dst_ip_raw)
+    }
+
+    branch jambo_one {
+        uint16 name_length
+        string(name_length) name
+
+        validate packet {
+            return packet.jambo.magic == 1
+        }
+    }
+}
