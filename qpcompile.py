@@ -3,7 +3,7 @@ import os
 import tokenize as tok
 from StringIO import StringIO
 from importlib import import_module
-from types import ModuleType
+from functools import partial
 from cPickle import dump as pickle_dump, load as pickle_load, HIGHEST_PROTOCOL
 from qparse import Parser, STRUCT_CONSTS
 
@@ -40,10 +40,14 @@ RESERVED_NAMES = (VALIDATE, BRANCH, AS, PROPERTY)
 
 PROTOCOL = 'protocol'
 IMPORT = 'import'
+COMMENT = '#'
 
 
 SBLOCK = '{'
 EBLOCK = '}'
+
+
+COMPILED_SIGNATURE = 'QuickParseY'
 
 
 def syntax(condition, msg=''):
@@ -51,16 +55,113 @@ def syntax(condition, msg=''):
         raise SyntaxError(msg)
 
 
+class Scope(object):
+    def __init__(self, **kwargs):
+        self.inner_scopes = []
+        for k, v in kwargs.iteritems():
+            setattr(self, k, v)
+
+
+class GlobalScope(Scope):
+    def __init__(self):
+        super(GlobalScope, self).__init__(imports={})
+        self._moduls = None
+
+    def add_import(self, module, monicre=None):
+        monicre = monicre or module
+        self.imports[monicre] = module
+
+    def make(self):
+        self._moduls = {monicre: import_module(module)
+                        for monicre, module in self.imports.iteritems()}
+
+    def get_modules(self):
+        if self._moduls is None:
+            self.make()
+        return self._moduls.copy()
+
+    def __str__(self):
+        sio = StringIO()
+        sio.write('from qparse import Parser, STRUCT_CONSTS\n')
+        for monicre, mod in self.imports.iteritems():
+            sio.write('import {} as {}\n'.format(mod, monicre))
+        sio.write('\n\n')
+        for proto in self.inner_scopes:
+            sio.write(proto)
+        sio.seek(0)
+        return sio.read().replace('\t', ' ' * 4)
+
+
+class ProtocolScope(Scope):
+    def __init__(self, name, global_scope):
+        super(ProtocolScope, self).__init__(name=name, fields=[], sources={}, endianity="network")
+        self._global = global_scope
+
+    def add_branch(self, branch):
+        self.inner_scopes.append(branch)
+
+    def make(self):
+        validate = {'validate': lambda s, p: True}
+        properties = {}
+        if 'validate' in self.sources:
+            exec self.sources['validate'] in self._global.get_modules(), validate
+        for prop in filter(lambda s: s != 'validate', self.sources):
+            exec self.sources[prop] in self._global.get_modules(), properties
+        protocol_dict = {'NAMESPACE': self.name,
+                         'ENDIANITY': STRUCT_CONSTS[self.endianity],
+                         'DEFINITION': ';'.join(self.fields),
+                         'validate': validate['validate'],
+                         'EXTENDED_PROPERTIES': properties.keys()}
+        protocol_dict.update(properties)
+        protocol = type(self.name,
+                        (Parser,),
+                        protocol_dict)
+        for branch in self.inner_scopes:
+            protocol.branch(branch.make())
+        return protocol
+
+    def __str__(self):
+        sio = StringIO()
+        sio.write('class {}(Parser):\n'.format(self.name))
+        sio.write('\tNAMESPACE = "{}"\n'.format(self.name))
+        sio.write('\tENDIANITY = STRUCT_CONSTS["{}"]\n'.format(self.endianity))
+        sio.write('\tDEFINITION = "{}"\n'.format(';'.join(self.fields)))
+        sio.write('\tEXTENDED_PROPERTIES = {}\n'.format(filter(lambda s: s != 'validate',
+                                                               self.sources)))
+        sio.write('\n')
+        for source in self.sources.itervalues():
+            source = source.replace('\r', '\n')
+            for line in source.split('\n'):
+                if line:
+                    sio.write('\t{}\n'.format(line))
+            sio.write('\n')
+        sio.write('\n')
+        for branch in self.inner_scopes:
+            sio.write('@{}.branch\n'.format(self.name))
+            sio.write(branch)
+        sio.seek(0)
+        return sio.read()
+
+
 class QPTokenizer(object):
-    def __init__(self, save_sources=False):
-        self._save_sources = save_sources
+    def __init__(self):
         self._gen = None
         self.globals = None
-        self.imports = {}
+        self.guide = {COMMENT: self.handle_comment,
+                      PROTOCOL: partial(self.handle_branch, main=True),
+                      BRANCH: self.handle_branch,
+                      IMPORT: self.handle_import}
+
+    def factory(self, token, scope=None):
+        if scope is None:
+            syntax(token in (PROTOCOL, IMPORT),
+                   'Expected "protocol" or "import" at global scope, not ' + token)
+            return self.guide[token]()
+        return self.guide[token](scope)
 
     def _init_token_gen(self, src):
         self._gen = tok.generate_tokens(src.readline)
-        self.globals = None
+        self.globals = GlobalScope()
         self.imports = {}
 
     def gtok(self):
@@ -85,29 +186,38 @@ class QPTokenizer(object):
         syntax(tk == tok.NAME, 'There should be a name token here.')
         return val
 
-    def handle_branch(self, lcl=None, main=False):
-        pglb = {"name": self.get_name(), "fields": [], "validate": lambda s, p: True,
-                "branches": [], "endianity": 'network', "properties": {}, "sources": {}}
+    def handle_import(self):
+        mod = self.get_name()
+        monicre = mod
+        tk, val = self.gtok()
+        syntax(tk in (tok.NL, tok.NEWLINE) or val == AS)
+        if tk not in (tok.NL, tok.NEWLINE):
+            monicre = self.get_name()
+        self.globals.add_import(mod, monicre)
+        return self.gtok_skipnl()[1]
+
+    def handle_branch(self, scope=None, main=False):
+        proto = ProtocolScope(self.get_name(), self.globals)
         if main:
-            self.globals = pglb
+            self.globals.inner_scopes.append(proto)
         else:
-            lcl["branches"].append(pglb)
-        self.handle_block(pglb)
+            scope.add_branch(proto)
+        self.handle_protocol_block(proto)
 
     def handle_comment(self):
         tk, _ = self.gtok()
         while not tk in (tok.NL, tok.NEWLINE):
             tk, _ = self.gtok()
 
-    def handle_endianity(self, lcl):
+    def handle_endianity(self, scope):
         bufr = []
         tk, val = self.gtok()
         while not tk in (tok.NL, tok.NEWLINE):
             bufr.append(val)
             tk, val = self.gtok()
-        lcl['endianity'] = ' '.join(bufr)
+        scope.endianity = ' '.join(bufr)
 
-    def handle_block(self, lcl):
+    def handle_protocol_block(self, scope):
         tk, val = self.gtok_skipnl()
         syntax(tk == tok.OP and val == SBLOCK, 'There should be a block starter here.')
         self.assert_new_line()
@@ -116,30 +226,29 @@ class QPTokenizer(object):
             syntax(tk in (tok.NAME, tok.COMMENT), '{}: {}'.format(tk, repr(val)))
             if tk == tok.NAME:
                 if val not in RESERVED_NAMES:
-                    self.handle_var(lcl, val)
+                    self.handle_var(scope, val)
                 elif val == BRANCH:
-                    self.handle_branch(lcl)
+                    self.handle_branch(scope)
                 elif val == VALIDATE:
-                    self.handle_validate(lcl)
+                    self.handle_validate(scope)
                 elif val == AS:
-                    self.handle_endianity(lcl)
+                    self.handle_endianity(scope)
                 elif val == PROPERTY:
-                    self.handle_property(lcl)
+                    self.handle_property(scope)
             elif tk == tok.COMMENT:
                 self.handle_comment()
             tk, val = self.gtok_skipnl()
 
-    def handle_var(self, lcl, first_token):
+    def handle_var(self, scope, first_token):
         syntax(first_token in VARS, "Unexpected name token: " + first_token)
         bfr = [first_token]
         tk, val = self.gtok()
         while tk not in (tok.NL, tok.NEWLINE):
             bfr.append(val)
             tk, val = self.gtok()
-        lcl['fields'].append(' '.join(bfr))
+        scope.fields.append(' '.join(bfr))
 
-    def handle_function_block(self, lcl, func_name, params, context=None):
-        context = context or {}
+    def handle_function_block(self, scope, func_name, params):
         native_string = 'def {}({}):\n'.format(func_name, ', '.join(params))
         tk, val = self.gtok_skipnl()
         syntax(tk == tok.OP and val == SBLOCK, 'There should be a block starter here.')
@@ -161,56 +270,29 @@ class QPTokenizer(object):
         offset = len(min([re.match('(\s*)\w', line).groups(1)[0] for line in lines]))
         for line in lines:
             native_string += (' ' * 4) + line[offset:].replace('\t', ' ' * 4)
-        exec native_string in self.imports, context
-        return context[func_name], native_string
+        scope.sources[func_name] = native_string
 
-    def handle_validate(self, lcl):
+    def handle_validate(self, scope):
         param = self.get_name()
-        _, source = self.handle_function_block(lcl, 'validate', ('self', param), lcl)
-        if self._save_sources:
-            lcl['sources']['validate'] = source
+        self.handle_function_block(scope, 'validate', ('self', param))
 
-    def handle_property(self, lcl):
+    def handle_property(self, scope):
         func_name = self.get_name()
         param = self.get_name()
-        lcl['properties'][func_name], source = self.handle_function_block(lcl, func_name,
-                                                                          ('self', param))
-        if self._save_sources:
-            lcl['sources'][func_name] = source
-
-    def _get_protocol(self, lcl):
-        protocol_dict = {'NAMESPACE': lcl['name'],
-                         'ENDIANITY': STRUCT_CONSTS[lcl['endianity']],
-                         'DEFINITION': ';'.join(lcl['fields']),
-                         'validate': lcl['validate'],
-                         'EXTENDED_PROPERTIES': lcl['properties'].keys()}
-        protocol_dict.update(lcl['properties'])
-        protocol = type(lcl['name'],
-                        (Parser,),
-                        protocol_dict)
-        for branch in lcl['branches']:
-            protocol.branch(self._get_protocol(branch))
-        return protocol
+        self.handle_function_block(scope, func_name, ('self', param))
 
     def compile_source(self, src):
         self._init_token_gen(src)
         cmd = self.get_name()
-        while cmd == IMPORT:
-            mod = self.get_name()
-            monicre = mod
-            tk, val = self.gtok()
-            syntax(tk in (tok.NL, tok.NEWLINE) or val == AS)
-            if tk not in (tok.NL, tok.NEWLINE):
-                monicre = self.get_name()
-            self.imports[monicre] = import_module(mod)
-            cmd = self.gtok_skipnl()[1]
-        syntax(cmd == PROTOCOL, 'Expected "protocol" at file start, not ' + cmd)
-        self.handle_branch(main=True)
-        return self.globals, self.imports
+        try:
+            while cmd is not None:
+                cmd = self.factory(cmd)
+        except StopIteration:
+            pass
 
     def parse_source(self, src):
-        compiled, _ = self.compile_source(src)
-        return self._get_protocol(compiled)
+        self.compile_source(src)
+        return {proto.name: proto.make() for proto in self.globals.inner_scopes}
 
     def parse_file(self, path):
         with open(path, 'rb') as qp:
@@ -220,58 +302,41 @@ class QPTokenizer(object):
         return self.parse_source(StringIO(string))
 
 
-def _clean_compiled(cdict):
-    del cdict['validate']
-    del cdict['properties']
-    for branch in cdict['branches']:
-        _clean_compiled(branch)
-
-
-def compile_file(path):
-    qpt = QPTokenizer(True)
-    with open(path, 'rb') as qp:
-        compiled, imports = qpt.compile_source(qp)
-    imported = {name: mod.__name__ for name, mod in imports.iteritems() if isinstance(mod,
-                                                                                      ModuleType)}
-    _clean_compiled(compiled)
-    dump = {'tree': compiled, 'imports': imported}
-    base_dir, parser = os.path.split(path)
-    cparser = parser + 'y'
-    pickle_dump(dump, open(os.path.join(base_dir, cparser), 'wb'), HIGHEST_PROTOCOL)
-
-
-def _dynamic_compile_tree(tree, imports):
-    tree['validate'] = lambda s, p: True
-    tree['properties'] = {}
-    if 'validate' in tree['sources']:
-        exec tree['sources']['validate'] in imports, tree
-        del tree['sources']['validate']
-    for func in tree['sources']:
-        exec tree['sources'][func] in imports, tree['properties']
-    for branch in tree['branches']:
-        _dynamic_compile_tree(branch, imports)
-
-
-def import_parser(path):
+def compile_file(path, to_python=False):
     qpt = QPTokenizer()
-    if path.endswith('qpy'):
-        dump = pickle_load(open(path, 'rb'))
-        imports = {name: import_module(modname) for name, modname in dump['imports'].iteritems()}
-        compiled = dump['tree']
-        _dynamic_compile_tree(compiled, imports)
-        return qpt._get_protocol(compiled)
-    elif path.endswith('qp'):
+    with open(path, 'rb') as qp:
+        qpt.compile_source(qp)
+    base_dir, parser = os.path.split(path)
+    if not to_python:
+        cparser = parser + 'y'
+        cfile = open(os.path.join(base_dir, cparser), 'wb')
+        cfile.write(COMPILED_SIGNATURE)
+        pickle_dump(qpt.globals, cfile, HIGHEST_PROTOCOL)
+    else:
+        cparser = parser.split('.')[0] + '.py'
+        cfile = open(os.path.join(base_dir, cparser), 'wb')
+        cfile.write(str(qpt.globals))
+
+
+def import_parser(path, auto=True, from_raw=True):
+    qpt = QPTokenizer()
+    if (auto and path.endswith('qpy')) or (not auto and not from_raw):
+        cfile = open(path, 'rb')
+        assert cfile.read(len(COMPILED_SIGNATURE)) == COMPILED_SIGNATURE, "Wrong file format"
+        dump = pickle_load(cfile)
+        return {proto.name: proto.make() for proto in dump.inner_scopes}
+    elif (auto and path.endswith('qp')) or (not auto and from_raw):
         return qpt.parse_file(path)
     else:
-        raise ValueError("parser path should end with .qp for raw parsers, "
+        raise ValueError("auto parser path should end with .qp for raw parsers, "
                          "or .qpy for compiled ones.")
 
 
 if __name__ == "__main__":
     from qparse import Ethernet, IP, ParsingChain, PacketContainer
     from operator import add
-    compile_file('jambo.qp')
-    JamboParser = import_parser('jambo.qpy')
+    compile_file('jambo.qp', True)
+    JamboParser = import_parser('jambo.qpy')['jambo']
     binds = ParsingChain()
     binds.add(None, Ethernet)
     binds.add(Ethernet, IP)
